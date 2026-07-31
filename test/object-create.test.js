@@ -81,6 +81,23 @@ test("function module create needs group and posts under it", () => {
   assert.equal(r.path, "/sap/bc/adt/functions/groups/zgroup/fmodules");
   assert.match(r.body, /adtcore:type="FUGR\/FF"/);
   assert.match(r.body, /containerRef[^>]*adtcore:name="ZGROUP"/);
+  assert.match(r.body, /containerRef adtcore:uri="\/sap\/bc\/adt\/functions\/groups\/zgroup"/);
+});
+
+test("function module create percent-encodes a namespaced group everywhere (#100)", () => {
+  const r = buildCreateRequest({
+    type: "function",
+    name: "/NSX/Z_FM",
+    package: "/NSX/PKG",
+    group: "/NSX/GRP",
+  });
+  // Both the POST target and the containerRef inside the body carry the group as
+  // ONE encoded path segment. Leaving the slashes raw in the body produced
+  // ".../groups//nsx/grp" — a resource that doesn't exist, hence the 500 (#100).
+  assert.equal(r.path, "/sap/bc/adt/functions/groups/%2Fnsx%2Fgrp/fmodules");
+  assert.match(r.body, /containerRef adtcore:uri="\/sap\/bc\/adt\/functions\/groups\/%2Fnsx%2Fgrp"/);
+  assert.doesNotMatch(r.body, /groups\/\/nsx/);
+  assert.match(r.body, /containerRef[^>]*adtcore:name="\/NSX\/GRP"/);
 });
 
 test("CDS / DCLS / DDLX / BDEF / MSAG endpoints route correctly", () => {
@@ -262,4 +279,62 @@ test("postCreate: the wildcard rescues a system that 415s every versioned type (
   ]);
   assert.equal(res.status, 201);
   assert.equal(contentType, "application/*");
+});
+
+test("postCreate: 400 ExceptionInvalidData also walks down the version chain", async () => {
+  // Function-group create on SAP_BASIS 755: the v3 media type is accepted by
+  // content negotiation but its schema doesn't match the body, so the server
+  // answers 400 "Data is invalid and could not be converted". The identical body
+  // succeeds as v2. A 415-only fallback left the tool permanently broken.
+  const attempts = [];
+  const client = {
+    async request({ headers }) {
+      const ct = headers["Content-Type"];
+      attempts.push(ct);
+      const ok = ct === "application/vnd.sap.adt.functions.groups.v2+xml";
+      return {
+        ok,
+        status: ok ? 200 : 400,
+        async text() {
+          return ok
+            ? "<created/>"
+            : '<exc:exception><type id="ExceptionInvalidData"/><message lang="EN">Data is invalid and could not be converted</message></exc:exception>';
+        },
+      };
+    },
+  };
+  const { res, contentType } = await postCreate(client, {
+    path: "/sap/bc/adt/functions/groups",
+    contentType: "application/vnd.sap.adt.functions.groups.v3+xml",
+    body: "<group/>",
+  });
+  assert.deepEqual(attempts, [
+    "application/vnd.sap.adt.functions.groups.v3+xml",
+    "application/vnd.sap.adt.functions.groups.v2+xml",
+  ]);
+  assert.equal(res.status, 200);
+  assert.equal(contentType, "application/vnd.sap.adt.functions.groups.v2+xml");
+});
+
+test("postCreate: a 400 that is NOT a media-type mismatch is returned as-is", async () => {
+  const attempts = [];
+  const client = {
+    async request({ headers }) {
+      attempts.push(headers["Content-Type"]);
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return '<exc:exception><type id="ExceptionResourceCreationFailure"/></exc:exception>';
+        },
+      };
+    },
+  };
+  const { res } = await postCreate(client, {
+    path: "/x",
+    contentType: "application/vnd.sap.adt.oo.classes.v3+xml",
+    body: "<x/>",
+  });
+  assert.equal(attempts.length, 1, "no pointless retries on a real request error");
+  assert.equal(res.status, 400);
 });

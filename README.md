@@ -337,7 +337,7 @@ or rejecting credentials. Run this first when troubleshooting.
 | `adt_browse_package` | One level of package contents. | |
 | `adt_list_packages` | Recursive walk from a root. | Has `prefix` (only descend into matching subpackages) and `maxPackages` safety cap (default 200). |
 | `adt_search_objects` | Quick-search by name pattern. | `*` wildcard. Returns parsed `{ name, type, description, packageName, uri }` records. |
-| `adt_where_used` | Where-used list. | Same parsed record shape. |
+| `adt_where_used` | Where-used list. | Same parsed record shape. Capped at `maxResults` (default 200); the response carries the backend's own `numberOfResults` plus `truncated` when the list was cut. |
 
 ### Cross-system
 

@@ -4,6 +4,10 @@ import { parseObjectReferences, parseUsageReferences } from "../object-reference
 import { errorResult, jsonResult, textResult } from "../result.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 
+// Default cap on the where-used list. RIS happily returns five figures of
+// references for a central object; the caller can raise it per call.
+const WHERE_USED_DEFAULT_MAX = 200;
+
 function defaultDescendPrefix(pkg) {
   if (pkg.startsWith("/")) {
     const second = pkg.indexOf("/", 1);
@@ -109,7 +113,8 @@ export const tools = [
   },
   {
     name: "adt_where_used",
-    description: "Where-used list for an object. Returns the references that point to it.",
+    description:
+      "Where-used list for an object. Returns the references that point to it. Widely-used objects can have thousands of references, so the list is capped at `maxResults` (default 200) — `numberOfResults` always reports the backend's full count and `truncated` says whether the list was cut.",
     inputSchema: {
       type: "object",
       properties: {
@@ -117,6 +122,11 @@ export const tools = [
         object: { type: "string", description: "Object name." },
         type: { type: "string", description: OBJECT_TYPE_HINT },
         group: { type: "string", description: "Function group (for FUGR/FF or FUGR/I)." },
+        maxResults: {
+          type: "integer",
+          description: `Maximum references to return (default ${WHERE_USED_DEFAULT_MAX}). Raise it when you need the full list of a heavily-used object.`,
+          minimum: 1,
+        },
       },
       required: ["object", "type"],
     },
@@ -307,11 +317,26 @@ export function register({ getClient }) {
       const text = await res.text();
       if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"));
       const refs = parseUsageReferences(text);
+      // The backend's own count, from <usageReferenceResult numberOfResults="…">.
+      // It differs from refs.length: the parser walks every <adtObject> node,
+      // and a single referenced object contributes one per usage occurrence.
+      const declared = /<(?:[\w]+:)?usageReferenceResult\b[^>]*\bnumberOfResults="(\d+)"/i.exec(text);
+      const max =
+        Number.isInteger(args.maxResults) && args.maxResults > 0
+          ? args.maxResults
+          : WHERE_USED_DEFAULT_MAX;
+      // A heavily-used object (e.g. CL_GUI_FRONTEND_SERVICES → 11k refs, ~126 KB)
+      // would otherwise flood the agent's context in one call.
+      const shown = refs.slice(0, max);
       return jsonResult({
         system: sys,
         object: args.object,
-        count: refs.length,
-        references: refs,
+        count: shown.length,
+        ...(declared ? { numberOfResults: Number(declared[1]) } : {}),
+        ...(refs.length > shown.length
+          ? { truncated: true, totalParsed: refs.length, maxResults: max }
+          : {}),
+        references: shown,
         raw: refs.length === 0 ? text : undefined,
       });
     },

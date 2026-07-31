@@ -6,6 +6,30 @@ adheres to semantic versioning once it reaches 1.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`adt_create_object` 500 on a function module in a namespaced group (#100).**
+  The POST target percent-encoded the group name, but the `containerRef` inside
+  the body did not — `/FGLR/DEVC` became `…/functions/groups//fglr/devc`, an
+  extra path segment pointing at a resource that doesn't exist, so the backend
+  answered 500. Both places now encode the group as one path segment.
+- **`adt_create_object type=functiongroup` never worked.** Found while verifying
+  the above: a stock S/4 (SAP_BASIS 755) rejects the declared v3 media type with
+  400 `ExceptionInvalidData` ("Data is invalid and could not be converted") and
+  accepts the identical body as v2. The media-type fallback only retried on 415,
+  so the create always failed. It now also walks down the version chain on a
+  400 `ExceptionInvalidData`. Verified end to end on a live system: function
+  group + function module created in `$TMP` and deleted again.
+
+### Changed
+
+- **`adt_where_used` no longer floods the context.** A central object can carry
+  five figures of references (`CL_GUI_FRONTEND_SERVICES`: 11117 parsed entries,
+  ~126 KB in one tool result). The list is now capped at `maxResults`
+  (default 200) and the response carries `numberOfResults` — the backend's own
+  count from `usageReferenceResult` — plus `truncated` / `totalParsed` when the
+  list was cut.
+
 ## [0.8.55]
 
 ### Changed

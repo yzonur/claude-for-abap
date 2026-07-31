@@ -209,6 +209,48 @@ test("adt_where_used: POSTs a usageReferenceRequest body so the server accepts i
   assert.equal(calls[0].headers["Content-Type"], "application/*");
 });
 
+test("adt_where_used: reports the backend's own count and caps the list (#99)", async () => {
+  // Two <adtObject> nodes per referenced object — the parser sees 4, the backend
+  // declares 2. Both numbers are surfaced, and maxResults trims the list.
+  const refs = [1, 2, 3, 4]
+    .map(
+      (n) =>
+        `<usageReferences:referencedObject uri="/sap/bc/adt/oo/classes/zcl_${n}">` +
+        `<usageReferences:adtObject adtcore:name="ZCL_${n}" adtcore:type="CLAS/OC"/>` +
+        `</usageReferences:referencedObject>`
+    )
+    .join("");
+  const xml =
+    '<usageReferences:usageReferenceResult xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences"' +
+    ' xmlns:adtcore="http://www.sap.com/adt/core" numberOfResults="2">' +
+    `<usageReferences:referencedObjects>${refs}</usageReferences:referencedObjects>` +
+    "</usageReferences:usageReferenceResult>";
+  const reply = {
+    ok: true,
+    status: 200,
+    headers: { get: () => "application/xml" },
+    text: async () => xml,
+  };
+
+  const { ctx } = makeCtx({ responses: [reply] });
+  const full = JSON.parse(
+    (await registerDiscovery(ctx).adt_where_used({ object: "ZCL_X", type: "class" })).content[0].text
+  );
+  assert.equal(full.numberOfResults, 2, "backend count is passed through");
+  assert.equal(full.count, 4);
+  assert.equal(full.truncated, undefined, "under the default cap nothing is trimmed");
+
+  const capped = makeCtx({ responses: [reply] });
+  const trimmed = JSON.parse(
+    (await registerDiscovery(capped.ctx).adt_where_used({ object: "ZCL_X", type: "class", maxResults: 2 })).content[0].text
+  );
+  assert.equal(trimmed.count, 2);
+  assert.equal(trimmed.references.length, 2);
+  assert.equal(trimmed.truncated, true);
+  assert.equal(trimmed.totalParsed, 4);
+  assert.equal(trimmed.numberOfResults, 2);
+});
+
 test("adt_where_used: a function module without group returns a clean error, not a crash (#74)", async () => {
   const { ctx, calls } = makeCtx();
   const h = registerDiscovery(ctx);

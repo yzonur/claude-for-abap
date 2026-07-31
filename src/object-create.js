@@ -114,15 +114,21 @@ export function buildCreateRequest({
       }
       const upperGroup = group.toUpperCase();
       const lowerGroup = group.toLowerCase();
+      // The group name goes into a URL path segment twice — the POST target and
+      // the containerRef inside the body — so it must be percent-encoded both
+      // times. A namespaced group (/FGLR/DEVC) otherwise produced a containerRef
+      // of ".../groups//fglr/devc": an extra path segment pointing at a resource
+      // that doesn't exist, which the backend answered with a 500 (#100).
+      const groupSegment = encodeURIComponent(lowerGroup);
       return {
-        path: `/sap/bc/adt/functions/groups/${encodeURIComponent(lowerGroup)}/fmodules`,
+        path: `/sap/bc/adt/functions/groups/${groupSegment}/fmodules`,
         contentType: "application/vnd.sap.adt.functions.fmodules.v3+xml",
         body: xmlDecl() +
           `<fm:abapFunctionModule xmlns:fm="http://www.sap.com/adt/functions/fmodules"` +
           ` xmlns:adtcore="http://www.sap.com/adt/core"` +
           ` adtcore:name="${escapeXml(upperName)}" adtcore:type="FUGR/FF"` +
           ` adtcore:description="${escapeXml(desc)}"${respAttr}>` +
-          `<fm:containerRef adtcore:uri="/sap/bc/adt/functions/groups/${escapeXml(lowerGroup)}"` +
+          `<fm:containerRef adtcore:uri="/sap/bc/adt/functions/groups/${escapeXml(groupSegment)}"` +
           ` adtcore:type="FUGR/F" adtcore:name="${escapeXml(upperGroup)}"/>` +
           `</fm:abapFunctionModule>`,
       };
@@ -230,9 +236,23 @@ export function mediaTypeFallbacks(contentType) {
   return chain;
 }
 
+// Two responses mean "this media-type version is the wrong one", and both are
+// cured by walking further down the version chain:
+//   * 415 — the server doesn't know this media type at all.
+//   * 400 ExceptionInvalidData — it knows the type but the payload doesn't match
+//     THAT version's schema. Function-group create is the live example: a stock
+//     S/4 (SAP_BASIS 755) rejects the v3 media type with "Data is invalid and
+//     could not be converted" and accepts the identical body as v2, so a
+//     415-only fallback left `adt_create_object type=functiongroup` permanently
+//     broken.
+function shouldTryNextMediaType(status, text) {
+  if (status === 415) return true;
+  return status === 400 && /ExceptionInvalidData/i.test(text ?? "");
+}
+
 // POST a create request, retrying with successively lower media-type versions
-// when the server rejects the content-type with 415. Returns
-// { res, text, contentType } for the first attempt that is not a 415 — or the
+// when the server rejects the content-type. Returns { res, text, contentType }
+// for the first attempt the server didn't reject on media-type grounds — or the
 // last attempt if every version is rejected. The body is read once here so
 // callers must use the returned `text` rather than calling res.text() again.
 export async function postCreate(client, { path, contentType, body, query }) {
@@ -250,7 +270,7 @@ export async function postCreate(client, { path, contentType, body, query }) {
       body,
     });
     text = await res.text();
-    if (res.status !== 415 || i === types.length - 1) break;
+    if (!shouldTryNextMediaType(res.status, text) || i === types.length - 1) break;
   }
   return { res, text, contentType: used };
 }
