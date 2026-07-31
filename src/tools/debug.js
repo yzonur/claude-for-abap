@@ -12,7 +12,14 @@
 // The listener and its breakpoints must share one terminalId + ideId for a
 // debuggee to be caught by *this* process, so those are a stable per-process
 // identity (like a single IDE instance). Debug flow-control / value writes
-// (step, setVariableValue) are Phase 2/3 and will gate on read-only mode.
+// (step, setVariableValue) are Phase 2/3 and gate on read-only mode.
+//
+// Two HTTP-contract details make or break the whole flow (#101):
+//   * /debugger/listeners serves ONE media type (application/vnd.sap.as+xml).
+//     With the wrong Accept the call just sits in the long poll and reports
+//     "no debuggee" — a silent false negative.
+//   * everything from `attach` onwards must carry X-sap-adt-sessiontype:
+//     stateful and share one cookie jar, or each call answers noSessionAttached.
 //
 // Every tool also returns `raw` (the ADT XML) alongside the best-effort parse,
 // so the agent always has the ground truth even where the light parser misses.
@@ -34,6 +41,49 @@ const SESSION = {
 const DEBUGGER = "/sap/bc/adt/debugger";
 const DEFAULT_LISTEN_MS = 30_000;
 const MAX_LISTEN_MS = 55_000; // stay under typical MCP call budgets
+
+// The ADT debugger is a STATEFUL protocol: `attach` opens a debug session bound
+// to the ABAP session behind the HTTP session, and every call after it must run
+// inside that session. Without this header attach still answers 200 and looks
+// fine, but the very next call fails with 404 / `noSessionAttached` (#101).
+// Breakpoint and listener calls are stateless — they exist independently of any
+// attached debuggee, and the verified recipe sends them without it.
+const STATEFUL = { "X-sap-adt-sessiontype": "stateful" };
+
+// The listener returns the trapped debuggee as ABAP-serialized XML
+// (STPDA_DEBUGGEE). This endpoint accepts exactly one media type and answers a
+// plain application/xml Accept with 406 ExceptionResourceNotAcceptable
+// ("Accepted content types: application/vnd.sap.as+xml"). Send the single value
+// the verified recipe uses — a comma list is not worth the risk on an endpoint
+// whose failure mode is a silent hang (#95, #101).
+const LISTENER_ACCEPT = "application/vnd.sap.as+xml";
+
+// How long a trapped debuggee waits for an attach before resuming on its own
+// (measured on SAP_BASIS 755). After that, attach answers 500 `invalidDebuggee`.
+const DEBUGGEE_ATTACH_WINDOW = "~15-20 s";
+
+// Every debugger call after `attach` runs in the debug session; a 404 whose
+// subType is `noSessionAttached` means there is no live session (nothing
+// attached, or the debuggee already resumed). That is a workflow state, not a
+// backend defect, so answer it with the recovery step instead of a raw error.
+// `continue` (and a `step` on the last executable line) lets the debuggee run to
+// the end. When nothing else traps it, the ABAP session finishes BEFORE the step
+// handler can build its answer, so ADT reports the step as
+// 500 SY/530 subType=debuggeeEnded. Verified live: the triggering HTTP request
+// completes at exactly that moment. That is the operation succeeding, not
+// failing — surfacing it as an error made a working `continue` look broken.
+function isDebuggeeEnded(text) {
+  return /debuggeeEnded/i.test(String(text ?? ""));
+}
+
+function noSessionHint(text) {
+  if (!/noSessionAttached/i.test(String(text ?? ""))) return null;
+  return (
+    "No debuggee is attached. Run adt_debug_listen to catch one again — a " +
+    `debuggee only waits ${DEBUGGEE_ATTACH_WINDOW} for the attach, so if the ` +
+    "previous one wasn't attached in time it has already resumed."
+  );
+}
 
 // --- light XML helpers (best-effort; raw XML is always returned too) ---------
 
@@ -131,7 +181,8 @@ export const tools = [
   {
     name: "adt_debug_set_breakpoint",
     description:
-      "Set an external ABAP debugger breakpoint at a line of an object. Pair with adt_debug_listen to catch a session that reaches it. Returns the breakpoint id (needed to delete it). Give either `uri` (a full ADT source URI) or `object`+`type` (+`include` for classes) with `line`.",
+      "Set an external ABAP debugger breakpoint at a line of an object. Pair with adt_debug_listen to catch a session that reaches it. Returns the breakpoint id (needed to delete it). Give either `uri` (a full ADT source URI) or `object`+`type` (+`include` for classes) with `line`. " +
+      "SCOPE: an external breakpoint traps HTTP/ICF (Fiori, OData, ADT), RFC and background sessions — NOT your own SAP GUI dialog session, so starting the report from SE38 with F8 traps nothing and opens no debugger. To debug dialog-only code, wrap it in an IF_OO_ADT_CLASSRUN class that runs it inside the ICF session: `SUBMIT <report> EXPORTING LIST TO MEMORY AND RETURN` (a bare SUBMIT has no screen to write to), then trigger POST /sap/bc/adt/oo/classrun/<class>. SUBMIT opens a fresh program context, so you debug the target on its own.",
     inputSchema: {
       type: "object",
       properties: {
@@ -168,7 +219,9 @@ export const tools = [
   {
     name: "adt_debug_listen",
     description:
-      "Wait (bounded long-poll) for a debuggee to hit a breakpoint set with adt_debug_set_breakpoint. Returns { caught: true, … } with a summary (and auto-attaches) when a session is trapped, or { caught: false } if none arrived within the timeout — in which case call it again (trigger the ABAP run meanwhile). One listener per process; set breakpoints first.",
+      "Wait (bounded long-poll) for a debuggee to hit a breakpoint set with adt_debug_set_breakpoint. Returns { caught: true, … } with a summary (and auto-attaches) when a session is trapped, or { caught: false } if none arrived within the timeout — in which case call it again. One listener per process; set breakpoints first. " +
+      "TIMING: arm the listener BEFORE triggering the ABAP run — for a fast request (Fiori/OData) arming it after clicking is already too late. A trapped debuggee then waits only ~15-20 s for the attach before resuming on its own. " +
+      "READING caught:false — it means one of: (a) the run hasn't been triggered yet, (b) the listener was armed too late, or (c) that line never executes in this flow. Keep a known-good control breakpoint (a line you are sure runs) to tell a wrong breakpoint apart from a setup problem.",
     inputSchema: {
       type: "object",
       properties: {
@@ -204,11 +257,17 @@ export const tools = [
   },
   {
     name: "adt_debug_stop",
-    description: "End the debug session: delete this process's listener and every breakpoint it set. Call when finished (or to reset after an error) so no dangling breakpoints/listeners are left on the system.",
+    description:
+      "End the debug session: release the attached debuggee (stepContinue), then delete this process's listener and every breakpoint it set. Call when finished (or to reset after an error) so no dangling breakpoints/listeners are left on the system and no suspended request is left hanging.",
     inputSchema: {
       type: "object",
       properties: {
         system: { type: "string", description: SYSTEM_HINT },
+        release: {
+          type: "boolean",
+          description:
+            "Resume the attached debuggee with stepContinue before cleaning up. Default true. Skipped under read-only mode (the debuggee then resumes by itself after ~15-20 s).",
+        },
         requestUser: { type: "string", description: "Defaults to the connection user." },
       },
     },
@@ -216,7 +275,7 @@ export const tools = [
   {
     name: "adt_debug_step",
     description:
-      "Advance the attached debuggee (Phase 2, flow control). `kind`: into (step into), over (step over), return (step out), continue (resume until the next breakpoint), runToLine / jumpToLine (need `uri`), terminate (stop the debuggee). WRITE — refused under read-only mode. Returns the new state (position, reached breakpoints) plus raw XML.",
+      "Advance the attached debuggee (Phase 2, flow control). `kind`: into (step into), over (step over), return (step out), continue (resume until the next breakpoint), runToLine / jumpToLine (need `uri`), terminate (stop the debuggee). WRITE — refused under read-only mode. Returns the new state (position, reached breakpoints) plus raw XML. A `continue` that lets the run finish answers `status: \"debuggeeEnded\"` — that is success (the debuggee resumed, the triggering request returned), not an error.",
     inputSchema: {
       type: "object",
       properties: {
@@ -392,18 +451,22 @@ export function register({ getClient }) {
           method: "POST",
           path: `${DEBUGGER}/listeners`,
           query,
-          // The listener returns the trapped debuggee as ABAP-serialized XML
-          // (STPDA_DEBUGGEE), whose media type is application/vnd.sap.as+xml —
-          // the same family the debugger's getVariables endpoint uses. Some
-          // systems reject a plain application/xml Accept here with 406
-          // ExceptionResourceNotAcceptable ("Accepted content types:
-          // application/vnd.sap.as+xml", #95). Offer the precise type first and
-          // keep application/xml as a fallback for lenient servers.
-          accept: "application/vnd.sap.as+xml, application/xml",
+          accept: LISTENER_ACCEPT,
           timeoutMs: timeout,
         });
         text = await res.text();
-        if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "listen" });
+        if (!res.ok) {
+          // Never fold a backend rejection into caught:false — with the wrong
+          // Accept the call used to hang until our own timeout and report "no
+          // debuggee", which reads as "nothing hit the breakpoint" (#101).
+          return errorResult(sys, res.status, text, res.headers.get("content-type"), {
+            stage: "listen",
+            hint:
+              res.status === 406
+                ? `The listener rejected our Accept header; it serves ${LISTENER_ACCEPT} only. This is a tool defect, not a missed breakpoint.`
+                : "The listener request was rejected by the backend — this is not a 'no debuggee' timeout.",
+          });
+        }
       } catch (err) {
         // Bounded poll: our own timeout firing just means "nobody hit it yet".
         if (/timed out after/i.test(String(err?.message))) {
@@ -425,16 +488,21 @@ export function register({ getClient }) {
         return jsonResult({ system: sys, caught: false, note: "No debuggee caught; call adt_debug_listen again.", raw: text });
       }
 
-      // Auto-attach so the caller can immediately read stack/variables.
+      // Auto-attach immediately — the debuggee only waits ~15-20 s, so there
+      // must be no other round trip between the catch and the attach.
       const attachRes = await client.request({
         method: "POST",
         path: DEBUGGER,
         query: { method: "attach", debuggeeId: debuggee.DEBUGGEE_ID, dynproDebugging: true, debuggingMode: "user", requestUser: ru.user },
+        headers: { ...STATEFUL },
         accept: "application/xml",
       });
       const attachText = await attachRes.text();
-      SESSION.attached = debuggee.DEBUGGEE_ID;
+      // Only a successful attach opens a debug session; recording a failed one
+      // would make the follow-up tools claim a session that doesn't exist.
+      if (attachRes.ok) SESSION.attached = debuggee.DEBUGGEE_ID;
       const reached = attrsOf("breakpoint", attachText);
+      const tooLate = /invalidDebuggee|debuggeeEnded/i.test(attachText);
       return jsonResult({
         system: sys,
         caught: true,
@@ -443,7 +511,9 @@ export function register({ getClient }) {
         reachedBreakpoints: reached,
         note: attachRes.ok
           ? "Attached. Use adt_debug_stack and adt_debug_variables to inspect."
-          : "Debuggee caught but attach failed — see rawAttach.",
+          : tooLate
+            ? `Debuggee caught but it had already resumed before the attach landed (a debuggee waits ${DEBUGGEE_ATTACH_WINDOW}). Arm adt_debug_listen before triggering the run and retry.`
+            : "Debuggee caught but attach failed — see rawAttach.",
         raw: text,
         rawAttach: attachText,
       });
@@ -455,10 +525,17 @@ export function register({ getClient }) {
         method: "GET",
         path: `${DEBUGGER}/stack`,
         query: { method: "getStack", emode: "_", semanticURIs: true },
+        headers: { ...STATEFUL },
         accept: "application/xml",
       });
       const text = await res.text();
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "stack" });
+      if (!res.ok) {
+        const hint = noSessionHint(text);
+        return errorResult(sys, res.status, text, res.headers.get("content-type"), {
+          stage: "stack",
+          ...(hint ? { hint } : {}),
+        });
+      }
       const stack = attrsOf("stackEntry", text);
       return jsonResult({ system: sys, depth: stack.length, stack, raw: stack.length ? undefined : text });
     },
@@ -477,12 +554,18 @@ export function register({ getClient }) {
         method: "POST",
         path: DEBUGGER,
         query: { method: "getVariables" },
-        headers: { "Content-Type": media },
+        headers: { "Content-Type": media, ...STATEFUL },
         accept: media,
         body,
       });
       const text = await res.text();
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "variables" });
+      if (!res.ok) {
+        const hint = noSessionHint(text);
+        return errorResult(sys, res.status, text, res.headers.get("content-type"), {
+          stage: "variables",
+          ...(hint ? { hint } : {}),
+        });
+      }
       const variables = recordsOf("STPDA_ADT_VARIABLE", text);
       return jsonResult({ system: sys, requested: names, variables, raw: variables.length ? undefined : text });
     },
@@ -491,6 +574,35 @@ export function register({ getClient }) {
       const { client, name: sys, profile } = getClient(args.system);
       const ru = resolveRequestUser(args, profile);
       if (ru.error) return textResult(ru.error, true);
+
+      // An attached debuggee is a *suspended HTTP request* on the backend (a
+      // Fiori/OData call, a background job). Deleting the listener doesn't
+      // resume it — only a step does. Release it first so nothing is left
+      // hanging. Under read-only we can't step; the debuggee resumes by itself.
+      let released = null;
+      if (SESSION.attached && args.release !== false) {
+        if (profile.readOnly) {
+          released = `skipped (read-only) — the debuggee resumes on its own after ${DEBUGGEE_ATTACH_WINDOW}`;
+        } else {
+          try {
+            const res = await client.request({
+              method: "POST",
+              path: DEBUGGER,
+              query: { method: "stepContinue" },
+              headers: { ...STATEFUL },
+              accept: "application/xml",
+            });
+            const body = await res.text();
+            released = res.ok
+              ? "continued"
+              : isDebuggeeEnded(body)
+                ? "continued (ran to completion)"
+                : `stepContinue failed (HTTP ${res.status})`;
+          } catch (err) {
+            released = `stepContinue failed (${err.message})`;
+          }
+        }
+      }
 
       const removed = [];
       // Delete the listener (best-effort).
@@ -519,7 +631,13 @@ export function register({ getClient }) {
       }
       SESSION.breakpoints = [];
       SESSION.attached = null;
-      return jsonResult({ system: sys, status: "stopped", listenerDeleted: true, breakpointsDeleted: removed });
+      return jsonResult({
+        system: sys,
+        status: "stopped",
+        ...(released ? { debuggee: released } : {}),
+        listenerDeleted: true,
+        breakpointsDeleted: removed,
+      });
     },
 
     // ── Phase 2 — flow control (WRITE) ──────────────────────────────────────
@@ -540,10 +658,30 @@ export function register({ getClient }) {
         method: "POST",
         path: DEBUGGER,
         query: { method, uri: args.uri },
+        headers: { ...STATEFUL },
         accept: "application/xml",
       });
       const text = await res.text();
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "step" });
+      if (!res.ok) {
+        if (isDebuggeeEnded(text)) {
+          SESSION.attached = null;
+          return jsonResult({
+            system: sys,
+            kind: args.kind,
+            status: "debuggeeEnded",
+            note:
+              "The debuggee resumed and ran to completion, so the debug session is over " +
+              "(the triggering request has returned). Nothing else trapped it — this is a " +
+              "successful continue, not a failure. Call adt_debug_listen again to catch the next run.",
+            raw: text,
+          });
+        }
+        const hint = noSessionHint(text);
+        return errorResult(sys, res.status, text, res.headers.get("content-type"), {
+          stage: "step",
+          ...(hint ? { hint } : {}),
+        });
+      }
       if (args.kind === "terminate") SESSION.attached = null;
       const step = attrsOf("step", text)[0] ?? {};
       const reached = attrsOf("breakpoint", text);
@@ -560,7 +698,7 @@ export function register({ getClient }) {
         if (!/^\/sap\/bc\/adt\/debugger\/stack\/type\/\w+\/position\/\d+$/.test(args.stackUri)) {
           return textResult(`adt_debug_goto_stack: stackUri must look like /sap/bc/adt/debugger/stack/type/<t>/position/<n> (got ${JSON.stringify(args.stackUri)}).`, true);
         }
-        const res = await client.request({ method: "PUT", path: args.stackUri, accept: "application/xml" });
+        const res = await client.request({ method: "PUT", path: args.stackUri, headers: { ...STATEFUL }, accept: "application/xml" });
         const text = await res.text();
         if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "goto-stack" });
         return jsonResult({ system: sys, stackUri: args.stackUri, status: "moved" });
@@ -570,6 +708,7 @@ export function register({ getClient }) {
           method: "POST",
           path: DEBUGGER,
           query: { method: "setStackPosition", position: args.position },
+          headers: { ...STATEFUL },
           accept: "application/xml",
         });
         const text = await res.text();
@@ -591,11 +730,18 @@ export function register({ getClient }) {
         method: "POST",
         path: DEBUGGER,
         query: { method: "setVariableValue", variableName: args.name },
+        headers: { ...STATEFUL },
         body: args.value,
         accept: "application/xml",
       });
       const text = await res.text();
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"), { stage: "set-variable" });
+      if (!res.ok) {
+        const hint = noSessionHint(text);
+        return errorResult(sys, res.status, text, res.headers.get("content-type"), {
+          stage: "set-variable",
+          ...(hint ? { hint } : {}),
+        });
+      }
       return jsonResult({ system: sys, name: args.name, value: args.value, status: "set", raw: text });
     },
 
@@ -622,6 +768,7 @@ export function register({ getClient }) {
           terminalId: SESSION.terminalId,
           ideId: SESSION.ideId,
         },
+        headers: { ...STATEFUL },
         accept: "application/xml",
       });
       const text = await res.text();
@@ -646,6 +793,7 @@ export function register({ getClient }) {
       const res = await client.request({
         method: "DELETE",
         path: `${DEBUGGER}/watchpoints/${encodeURIComponent(args.id)}`,
+        headers: { ...STATEFUL },
         accept: "application/xml",
       });
       const text = await res.text();

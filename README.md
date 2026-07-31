@@ -367,23 +367,49 @@ NW 7.31 SP04 + Kernel 7.21 (fine on S/4).
 | `adt_debug_listen` | Bounded wait for a debuggee to hit a breakpoint. | Returns `{ caught: true, debuggee, … }` and auto-attaches, or `{ caught: false }` on timeout (default 30 s, capped 55 s) — just call again. One listener per process. |
 | `adt_debug_stack` | Call stack of the attached debuggee. | |
 | `adt_debug_variables` | Read variable values. | `names: ['sy-subrc','lv_total']`; omit for the scope roots. |
-| `adt_debug_step` | Advance execution. **WRITE.** | `kind`: `into` / `over` / `return` / `continue` / `runToLine` / `jumpToLine` (need `uri`) / `terminate`. |
+| `adt_debug_step` | Advance execution. **WRITE.** | `kind`: `into` / `over` / `return` / `continue` / `runToLine` / `jumpToLine` (need `uri`) / `terminate`. A `continue` that lets the run finish answers `status: "debuggeeEnded"` — that is success. |
 | `adt_debug_goto_stack` | Move the active stack frame. **WRITE.** | `stackUri` (from the stack) or 0-based `position`. |
 | `adt_debug_set_variable` | Set a variable's value. **WRITE.** | `name` + `value`. Changes live session state. |
 | `adt_debug_set_watchpoint` / `adt_debug_delete_watchpoint` | Break when a variable changes. **WRITE.** | Best-effort — the watchpoint contract has no reference impl; check `raw` on a live run. |
-| `adt_debug_stop` | End the session: delete the listener + all breakpoints it set. | Call when done so nothing dangles on the system. |
+| `adt_debug_stop` | End the session: resume the debuggee, then delete the listener + all breakpoints it set. | Call when done so nothing dangles and no request stays suspended. `release: false` skips the resume. |
 
 Typical flow:
 
 ```text
 1.  adt_debug_set_breakpoint { object: "ZREPORT", type: "program", line: 42 }   → id
-2.  (run ZREPORT in SAP GUI / via a Fiori app / a job)
-3.  adt_debug_listen {}          → caught:false? call again. caught:true → attached
-4.  adt_debug_stack {}           → where execution paused
-5.  adt_debug_variables { names: ["sy-subrc", "lv_total"] }
-6.  adt_debug_step { kind: "over" }   → advance; or set_variable / continue
-7.  adt_debug_stop {}            → cleanup
+2.  adt_debug_listen {}          → ARM IT FIRST, then trigger the run
+3.  (trigger: a Fiori/OData call, an ADT classrun, an RFC, a job)
+4.  listen returns caught:true → already attached (or caught:false → call again)
+5.  adt_debug_stack {}           → where execution paused
+6.  adt_debug_variables { names: ["sy-subrc", "lv_total"] }
+7.  adt_debug_step { kind: "over" }   → advance; or set_variable / continue
+8.  adt_debug_stop {}            → resume the debuggee + cleanup
 ```
+
+**What an external breakpoint traps:** HTTP/ICF (Fiori, OData, ADT), RFC and
+background sessions — **not your own SAP GUI dialog session**. Running the report
+from SE38 with F8 traps nothing and opens no debugger, which reads like a broken
+feature but isn't. To debug dialog-only code, run it inside an ICF session with a
+throwaway `IF_OO_ADT_CLASSRUN` wrapper and trigger
+`POST /sap/bc/adt/oo/classrun/<class>`:
+
+```abap
+METHOD if_oo_adt_classrun~main.
+  DATA lt_list TYPE TABLE OF abaplist.
+  " There is no screen in an ICF session, so list output must go to memory.
+  SUBMIT zoy_dbg_target EXPORTING LIST TO MEMORY AND RETURN.
+ENDMETHOD.
+```
+
+`SUBMIT` opens a fresh program context, so you debug the target report on its own.
+
+**Timing:** arm `adt_debug_listen` *before* triggering the run — for a fast
+request (Fiori/OData) arming it after clicking is already too late. A trapped
+debuggee then waits only ~15–20 s for the attach before resuming on its own, so
+`listen` attaches immediately with no round trip in between. A `caught: false`
+can therefore mean three things: the run hasn't happened yet, the listener was
+armed too late, or that line never executes in this flow — keep a known-good
+control breakpoint to tell a wrong breakpoint apart from a setup problem.
 
 **Read-only mode:** inspection (breakpoints, listen, stack, variables) is allowed;
 the **WRITE** tools above (step, goto-stack, set-variable, watchpoints) are refused

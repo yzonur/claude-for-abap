@@ -87,12 +87,95 @@ test("adt_debug_listen: caught → auto-attaches and returns the debuggee", asyn
   assert.equal(payload.attached, true);
   assert.equal(payload.debuggee.DEBUGGEE_ID, "DBG-9");
   assert.equal(payload.debuggee.DEBUGGEE_USER, "DEV");
-  // The listener must accept ABAP-serialized XML (vnd.sap.as+xml); a plain
-  // application/xml Accept 406s on stricter systems (#95).
-  assert.match(calls[0].accept, /application\/vnd\.sap\.as\+xml/);
+  // The listener serves exactly one media type; anything else 406s (#95/#101).
+  assert.equal(calls[0].accept, "application/vnd.sap.as+xml");
+  assert.equal(calls[0].headers?.["X-sap-adt-sessiontype"], undefined, "listen is stateless");
   // second call is the attach, keyed by the debuggee id
   assert.equal(calls[1].query.method, "attach");
   assert.equal(calls[1].query.debuggeeId, "DBG-9");
+});
+
+test("every call from attach onwards is stateful, breakpoints/listen are not (#101)", async () => {
+  const stateful = (c) => c.headers?.["X-sap-adt-sessiontype"];
+  const { ctx, calls } = makeCtx([
+    { match: (c) => c.path.endsWith("/listeners"), reply: { text: DEBUGGEE_XML } },
+    { match: (c) => c.query?.method === "attach", reply: { text: ATTACH_XML } },
+    { match: () => true, reply: { text: "<x/>" } },
+  ]);
+  const h = register(ctx);
+
+  await h.adt_debug_set_breakpoint({ object: "ZFOO", type: "program", line: 5 });
+  assert.equal(stateful(calls.at(-1)), undefined, "set_breakpoint is stateless");
+
+  await h.adt_debug_listen({ timeout: 1000 });
+  assert.equal(stateful(calls.at(-1)), "stateful", "attach opens the debug session");
+
+  await h.adt_debug_stack({});
+  assert.equal(stateful(calls.at(-1)), "stateful");
+  await h.adt_debug_variables({ names: ["sy-subrc"] });
+  assert.equal(stateful(calls.at(-1)), "stateful");
+  await h.adt_debug_step({ kind: "over" });
+  assert.equal(stateful(calls.at(-1)), "stateful");
+  await h.adt_debug_goto_stack({ position: 1 });
+  assert.equal(stateful(calls.at(-1)), "stateful");
+  await h.adt_debug_set_variable({ name: "x", value: "1" });
+  assert.equal(stateful(calls.at(-1)), "stateful");
+});
+
+test("adt_debug_listen: a 406 from the listener is an error, not caught:false (#101)", async () => {
+  const { ctx } = makeCtx([
+    {
+      match: (c) => c.path.endsWith("/listeners"),
+      reply: {
+        ok: false,
+        status: 406,
+        text: '<exc:exception><type id="ExceptionResourceNotAcceptable"/><message lang="EN">Accepted content types: application/vnd.sap.as+xml</message></exc:exception>',
+      },
+    },
+  ]);
+  const r = await register(ctx).adt_debug_listen({});
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(r.isError, true);
+  assert.equal(payload.status, 406);
+  assert.match(payload.hint, /tool defect, not a missed breakpoint/);
+});
+
+test("adt_debug_listen: a debuggee that already resumed is reported, not silently attached (#101)", async () => {
+  _internals.SESSION.attached = null;
+  const { ctx } = makeCtx([
+    { match: (c) => c.path.endsWith("/listeners"), reply: { text: DEBUGGEE_XML } },
+    {
+      match: (c) => c.query?.method === "attach",
+      reply: {
+        ok: false,
+        status: 500,
+        text: '<exc:exception><properties><entry key="com.sap.adt.communicationFramework.subType">invalidDebuggee</entry></properties></exc:exception>',
+      },
+    },
+  ]);
+  const r = await register(ctx).adt_debug_listen({});
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(payload.caught, true);
+  assert.equal(payload.attached, false);
+  assert.match(payload.note, /already resumed/i);
+  assert.equal(_internals.SESSION.attached, null, "a failed attach must not claim a session");
+});
+
+test("noSessionAttached is answered with the recovery step (#101)", async () => {
+  const { ctx } = makeCtx([
+    {
+      match: (c) => c.path.endsWith("/stack"),
+      reply: {
+        ok: false,
+        status: 404,
+        text: '<exc:exception><properties><entry key="com.sap.adt.communicationFramework.subType">noSessionAttached</entry></properties></exc:exception>',
+      },
+    },
+  ]);
+  const r = await register(ctx).adt_debug_stack({});
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(payload.status, 404);
+  assert.match(payload.hint, /adt_debug_listen/);
 });
 
 test("adt_debug_listen: timeout → caught:false, call-again note (not an error)", async () => {
@@ -158,6 +241,7 @@ test("adt_debug_variables builds the getVariables body and parses values", async
 
 test("adt_debug_stop deletes the listener and tracked breakpoints", async () => {
   _internals.SESSION.breakpoints = [{ id: "BP-1", uri: "u" }, { id: "BP-2", uri: "u2" }];
+  _internals.SESSION.attached = null;
   const { ctx, calls } = makeCtx([{ match: () => true, reply: { text: "" } }]);
   const h = register(ctx);
   const r = await h.adt_debug_stop({});
@@ -167,6 +251,24 @@ test("adt_debug_stop deletes the listener and tracked breakpoints", async () => 
   assert.equal(deletes.filter((c) => /\/breakpoints\//.test(c.path)).length, 2, "both breakpoints deleted");
   assert.deepEqual(payload.breakpointsDeleted, ["BP-1", "BP-2"]);
   assert.deepEqual(_internals.SESSION.breakpoints, []);
+});
+
+test("adt_debug_stop releases an attached debuggee before cleaning up (#101)", async () => {
+  _internals.SESSION.breakpoints = [];
+  _internals.SESSION.attached = "DBG-9";
+  const { ctx, calls } = makeCtx([{ match: () => true, reply: { text: "" } }]);
+  const r = await register(ctx).adt_debug_stop({});
+  assert.equal(calls[0].query.method, "stepContinue", "the suspended request is resumed first");
+  assert.equal(calls[0].headers["X-sap-adt-sessiontype"], "stateful");
+  assert.equal(JSON.parse(r.content[0].text).debuggee, "continued");
+  assert.equal(_internals.SESSION.attached, null);
+
+  // Read-only can't step; say so instead of leaving the caller guessing.
+  _internals.SESSION.attached = "DBG-9";
+  const ro = makeCtx([{ match: () => true, reply: { text: "" } }], { profile: { user: "DEV", readOnly: true } });
+  const r2 = await register(ro.ctx).adt_debug_stop({});
+  assert.equal(ro.calls.some((c) => c.query?.method === "stepContinue"), false);
+  assert.match(JSON.parse(r2.content[0].text).debuggee, /read-only/);
 });
 
 test("requestUser gating: another user is refused unless the system opts in", async () => {
@@ -200,6 +302,31 @@ test("adt_debug_step maps friendly kinds to ADT DebugStepType", async () => {
   assert.equal(calls[1].query.method, "stepContinue");
   await h.adt_debug_step({ kind: "terminate" });
   assert.equal(calls[2].query.method, "terminateDebuggee");
+});
+
+test("adt_debug_step: a continue that finishes the run is success, not an error (#101)", async () => {
+  // Verified live: stepContinue on a debuggee that nothing else traps lets the
+  // ABAP session finish before ADT can answer, so the step comes back as
+  // 500 SY/530 debuggeeEnded — while the triggering HTTP request returns 200.
+  _internals.SESSION.attached = "DBG-9";
+  const { ctx } = makeCtx([
+    {
+      match: (c) => c.query?.method === "stepContinue",
+      reply: {
+        ok: false,
+        status: 500,
+        text:
+          '<exc:exception><type id="AdiFailed"/><message lang="EN">An exception was raised</message>' +
+          '<properties><entry key="com.sap.adt.communicationFramework.subType">debuggeeEnded</entry></properties></exc:exception>',
+      },
+    },
+  ]);
+  const r = await register(ctx).adt_debug_step({ kind: "continue" });
+  const payload = JSON.parse(r.content[0].text);
+  assert.notEqual(r.isError, true, "a completed run must not be reported as a failure");
+  assert.equal(payload.status, "debuggeeEnded");
+  assert.match(payload.note, /ran to completion/);
+  assert.equal(_internals.SESSION.attached, null);
 });
 
 test("adt_debug_step: runToLine requires a uri; unknown kind rejected", async () => {

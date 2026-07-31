@@ -6,7 +6,37 @@ adheres to semantic versioning once it reaches 1.0.0.
 
 ## [Unreleased]
 
+## [0.8.57]
+
 ### Fixed
+
+- **The debugger tool set was unusable (#101).** Three HTTP-contract defects,
+  all reproduced and then verified fixed end to end on a live system:
+  - **Missing stateful session.** ADT's debugger is a stateful protocol: `attach`
+    opens a debug session bound to the ABAP session, and every later call must
+    run inside it. Nothing sent `X-sap-adt-sessiontype: stateful`, so `attach`
+    answered 200 and looked fine while `stack` / `variables` / `step` all failed
+    with 404 `noSessionAttached`. The header is now on `attach` and every call
+    after it.
+  - **Wrong `Accept` on the listener.** `/debugger/listeners` serves exactly one
+    media type (`application/vnd.sap.as+xml`). The failure mode was silent: with
+    anything else the long poll just sat there and the tool reported
+    `caught: false` — indistinguishable from "nothing hit the breakpoint".
+    A backend rejection (406) is now reported as the error it is.
+  - **A successful `continue` was reported as a 500.** `stepContinue` on a
+    debuggee that nothing else traps lets the ABAP session finish before ADT can
+    answer, so the step comes back as 500 `SY/530` `debuggeeEnded` while the
+    triggering request returns 200. That is the operation succeeding; it now
+    answers `status: "debuggeeEnded"` with an explanation instead of an error.
+
+  Also: a failed `attach` no longer records a session that doesn't exist (and
+  says so when the debuggee had already resumed), `noSessionAttached` answers
+  with the recovery step, and `adt_debug_stop` now resumes the attached debuggee
+  (`release`, default true) before cleaning up, so no suspended request is left
+  hanging. The tool descriptions and README now state what an external
+  breakpoint actually traps (HTTP/ICF, RFC, background — *not* your own SAP GUI
+  dialog session), the `classrun` + `SUBMIT` workaround for dialog-only code,
+  and that the listener must be armed before the run is triggered.
 
 - **`adt_create_object` 500 on a function module in a namespaced group (#100).**
   The POST target percent-encoded the group name, but the `containerRef` inside

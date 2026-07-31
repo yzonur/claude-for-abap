@@ -1,6 +1,6 @@
 {
   "name": "sap-adt-mcp",
-  "version": "0.8.56",
+  "version": "0.8.57",
   "mcpName": "io.github.yzonur/sap-adt-mcp",
   "description": "MCP server giving Claude live access to SAP systems via ADT (ABAP Development Tools) REST. Read source, search, run syntax checks, and edit ABAP objects from any MCP-compatible client.",
   "type": "module",
