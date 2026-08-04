@@ -60,6 +60,32 @@ adheres to semantic versioning once it reaches 1.0.0.
   count from `usageReferenceResult` — plus `truncated` / `totalParsed` when the
   list was cut.
 
+## [0.8.56]
+
+### Fixed
+
+- **`adt_debug_listen` 406 on stricter systems (#95).** The
+  `/debugger/listeners` endpoint returns the trapped debuggee as
+  ABAP-serialized XML (`application/vnd.sap.as+xml`), so a plain
+  `application/xml` `Accept` was rejected with `406
+  ExceptionResourceNotAcceptable` on systems that enforce the precise type.
+  The listener now sends `application/vnd.sap.as+xml, application/xml`.
+  (0.8.57 revisits this: the endpoint serves *only* that one media type, and a
+  rejection is now surfaced instead of looking like an empty poll.)
+
+### Changed
+
+- **Stop auto-reporting two more environmental 5xx classes.**
+  - `adt_where_used` RIS reference-conversion failures (`com.sap.adt.ris`,
+    `RIS_MESSAGES/014` "Error while converting object references" — e.g.
+    where-used on a message class) are object/RIS-side limitations, not a
+    request-shape defect (#93).
+  - `adt_activate` envelope-less 5xx — no type, no T100, no message — is a bare
+    backend dump (e.g. activating an include mis-typed as a program) and carries
+    no request-shape signal (#96). Typed/messaged `activate` 5xx still report.
+- `adt_get_source` 500 "An exception was raised" (#94) needed no change: it has
+  been skipped since 0.8.55 (the #89 class); the report predates that release.
+
 ## [0.8.55]
 
 ### Changed
