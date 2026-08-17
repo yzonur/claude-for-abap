@@ -1,6 +1,6 @@
 import { objectUri, sourceUri, normalizeType } from "../object-uris.js";
 import { unifiedLineDiff } from "../diff.js";
-import { errorResult, jsonResult } from "../result.js";
+import { errorResult, jsonResult, textResult } from "../result.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 
 // Parse <vrs:version .../> or generic version entries that some ADT releases
@@ -8,18 +8,56 @@ import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 const VERSION_RE = /<(?:vrs:)?version\b([\s\S]*?)(?:\/>|>)/gi;
 const ATTR_RE = /([\w:.-]+)\s*=\s*"([^"]*)"/g;
 
+// The endpoint answers as an Atom feed (see ACCEPT below), so the version rows
+// arrive as <atom:entry> elements whose payload sits partly in attributes of
+// nested elements and partly in child text. Match the whole entry so both can
+// be harvested (#111).
+const ENTRY_RE = /<(?:\w+:)?entry\b[^>]*>([\s\S]*?)<\/(?:\w+:)?entry>/gi;
+const CHILD_TEXT_RE = /<(?:\w+:)?([\w.-]+)\b[^>]*>([^<]*)<\/(?:\w+:)?[\w.-]+>/g;
+
+function localName(qname) {
+  return qname.replace(/^[\w]+:/, "");
+}
+
 export function parseVersionList(xml) {
   if (typeof xml !== "string") return [];
   const out = [];
   for (const m of xml.matchAll(VERSION_RE)) {
     const attrs = {};
     for (const a of m[1].matchAll(ATTR_RE)) {
-      attrs[a[1].replace(/^[\w]+:/, "")] = a[2];
+      attrs[localName(a[1])] = a[2];
     }
     if (Object.keys(attrs).length) out.push(attrs);
   }
+  if (out.length) return out;
+
+  // Atom-feed shape: one <entry> per version. Collect every attribute found
+  // anywhere inside the entry plus every child element with plain text, so the
+  // caller sees the version number / user / timestamp whatever the release
+  // decided to call them. Last write wins — attributes are the more specific
+  // carrier, so they are read after the child text.
+  for (const e of xml.matchAll(ENTRY_RE)) {
+    const inner = e[1];
+    const row = {};
+    for (const c of inner.matchAll(CHILD_TEXT_RE)) {
+      const value = c[2].trim();
+      if (value) row[localName(c[1])] = value;
+    }
+    for (const a of inner.matchAll(ATTR_RE)) {
+      const key = localName(a[1]);
+      // Namespace declarations are noise, not version data.
+      if (key === "xmlns" || a[1].startsWith("xmlns:")) continue;
+      row[key] = a[2];
+    }
+    if (Object.keys(row).length) out.push(row);
+  }
   return out;
 }
+
+// {objectUri}/versions is an Atom feed and nothing else: asking for
+// "application/xml" makes it answer 406 ExceptionResourceNotAcceptable with
+// "Accepted content types: application/atom+xml;type=feed" (#111).
+export const VERSIONS_ACCEPT = "application/atom+xml;type=feed";
 
 export const tools = [
   {
@@ -40,7 +78,7 @@ export const tools = [
   {
     name: "adt_compare_versions",
     description:
-      "Diff two versions of the SAME object's source within one system. Defaults to active-vs-inactive (the daily 'what did I change but not yet activate' question). Pass from/to to compare specific version identifiers understood by the ADT ?version= query (e.g. 'active', 'inactive', or a numeric version number where supported). Returns a unified diff plus added/removed line counts, reusing the same diff engine as adt_compare_source.",
+      "Diff two versions of the SAME object's source within one system. Defaults to active-vs-inactive (the daily 'what did I change but not yet activate' question). from/to are passed to the ADT ?version= query, which only understands the symbolic values 'active' and 'inactive' — a numeric version number is rejected with 400 ExceptionParameterValueInvalid. Returns a unified diff plus added/removed line counts, reusing the same diff engine as adt_compare_source.",
     inputSchema: {
       type: "object",
       properties: {
@@ -51,11 +89,11 @@ export const tools = [
         include: { type: "string", description: "For classes: which include to compare." },
         from: {
           type: "string",
-          description: "Base version passed to ?version= (default 'inactive').",
+          description: "Base version passed to ?version= — 'active' or 'inactive' (default 'inactive').",
         },
         to: {
           type: "string",
-          description: "Target version passed to ?version= (default 'active').",
+          description: "Target version passed to ?version= — 'active' or 'inactive' (default 'active').",
         },
         context: {
           type: "integer",
@@ -76,7 +114,7 @@ export function register({ getClient }) {
       const objUri = objectUri({ type: args.type, name: args.object, group: args.group });
       const res = await client.request({
         path: `${objUri}/versions`,
-        accept: "application/xml",
+        accept: VERSIONS_ACCEPT,
       });
       const text = await res.text();
       if (res.status === 404) {
@@ -104,9 +142,25 @@ export function register({ getClient }) {
     },
 
     adt_compare_versions: async (args) => {
-      const { client, name: sys } = getClient(args.system);
       const from = args.from ?? "inactive";
       const to = args.to ?? "active";
+      // ?version= takes symbolic values only. A numeric identifier read off a
+      // version history 400s server-side with an opaque "could not be
+      // converted" message (#112); say so here instead of paying a round trip.
+      const numeric = [
+        ["from", from],
+        ["to", to],
+      ].find(([, v]) => /^\d+$/.test(String(v).trim()));
+      if (numeric) {
+        return textResult(
+          `adt_compare_versions: \`${numeric[0]}\` = '${numeric[1]}' — the ADT ?version= query only accepts ` +
+            "'active' or 'inactive'. A numeric version number is rejected by the backend with " +
+            "400 ExceptionParameterValueInvalid. To inspect older revisions use adt_list_versions " +
+            "and follow the version's own URI.",
+          true
+        );
+      }
+      const { client, name: sys } = getClient(args.system);
       const path = sourceUri({
         type: args.type,
         name: args.object,

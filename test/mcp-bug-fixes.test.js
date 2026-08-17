@@ -251,12 +251,58 @@ test("adt_where_used: reports the backend's own count and caps the list (#99)", 
   assert.equal(trimmed.numberOfResults, 2);
 });
 
-test("adt_where_used: a function module without group returns a clean error, not a crash (#74)", async () => {
+test("adt_where_used: echoes the raw ADT call so it can be replayed (#114)", async () => {
+  const { ctx } = makeCtx();
+  const h = registerDiscovery(ctx);
+  const out = JSON.parse(
+    (await h.adt_where_used({ object: "/FGLR/CL_EQUIPMENT_MAIN", type: "class" })).content[0].text
+  );
+  assert.equal(out.request.method, "POST");
+  assert.equal(out.request.path, "/sap/bc/adt/repository/informationsystem/usageReferences");
+  assert.equal(out.request.query.uri, "/sap/bc/adt/oo/classes/%2Ffglr%2Fcl_equipment_main");
+  // The replayable URL must carry the ?uri= value encoded exactly once more,
+  // the way the client puts it on the wire.
+  assert.equal(
+    out.request.url,
+    "/sap/bc/adt/repository/informationsystem/usageReferences" +
+      "?uri=%2Fsap%2Fbc%2Fadt%2Foo%2Fclasses%2F%252Ffglr%252Fcl_equipment_main"
+  );
+  assert.match(out.request.body, /usageReferenceRequest/);
+  assert.equal(out.request.headers["Content-Type"], "application/*");
+});
+
+test("adt_where_used: a function module whose group can't be found errors cleanly, no crash (#74)", async () => {
+  // The mock search answers with nothing, so the group stays unknown.
   const { ctx, calls } = makeCtx();
   const h = registerDiscovery(ctx);
   const r = await h.adt_where_used({ object: "/FGLR/DELIVERY_CREATE", type: "FUGR/FF" });
   assert.match(r.content[0].text, /pass 'group'/);
-  assert.equal(calls.length, 0, "must not issue a request when the URI can't be built");
+  assert.match(r.content[0].text, /adt_search_objects/);
+  assert.equal(
+    calls.filter((c) => c.path.includes("usageReferences")).length,
+    0,
+    "must not issue the where-used call when the URI can't be built"
+  );
+});
+
+test("adt_where_used: a bare function module resolves its group by search (#104)", async () => {
+  const searchHit = {
+    ok: true,
+    status: 200,
+    headers: { get: () => "application/xml" },
+    text: async () =>
+      '<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">' +
+      '<adtcore:objectReference adtcore:uri="/sap/bc/adt/functions/groups/%2Ffglr%2Fdelivery/fmodules/%2Ffglr%2Fdelivery_create"' +
+      ' adtcore:name="/FGLR/DELIVERY_CREATE" adtcore:type="FUGR/FF"/>' +
+      "</adtcore:objectReferences>",
+  };
+  const { ctx, calls } = makeCtx({ responses: [searchHit] });
+  const h = registerDiscovery(ctx);
+  const r = await h.adt_where_used({ object: "/FGLR/DELIVERY_CREATE", type: "FUGR/FF" });
+  assert.notEqual(r.isError, true);
+  const whereUsed = calls.find((c) => c.path.includes("usageReferences"));
+  assert.ok(whereUsed, "the where-used call must happen once the group is known");
+  assert.match(whereUsed.query.uri, /groups\/%2Ffglr%2Fdelivery\/fmodules\//);
 });
 
 // ─── Bug B: adt_read_table sends the data-preview table Accept header ──────────

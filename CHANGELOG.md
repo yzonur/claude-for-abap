@@ -6,6 +6,84 @@ adheres to semantic versioning once it reaches 1.0.0.
 
 ## [Unreleased]
 
+## [0.8.58]
+
+Clearing the open ADT error reports. Two of them were settled by probing a live
+system rather than by reading code, and the probe results are recorded on the
+issues.
+
+### Fixed
+
+- **`adt_list_versions` 406 on every object (#111).** `{objectUri}/versions` is
+  an Atom feed and serves nothing else; the request asked for `application/xml`
+  and the backend answered 406 `ExceptionResourceNotAcceptable` —
+  "Accepted content types: application/atom+xml;type=feed". It now asks for what
+  the endpoint serves, and the parser falls back to reading `<entry>` elements
+  so an Atom-shaped history is returned as version rows rather than raw XML.
+
+- **`adt_compare_versions` 400 on a numeric version (#112).** The ADT `?version=`
+  query only understands `active` and `inactive`; a version number is rejected
+  with `ExceptionParameterValueInvalid`, whose message ("could not be converted")
+  says nothing useful. The tool description no longer claims numeric versions
+  work, and a numeric `from`/`to` is now refused locally with an explanation
+  instead of costing a round trip.
+
+- **Includes could not be activated when they belong to several main programs
+  (#113).** An include compiles only inside a main program, and the activation
+  service gives up with 500 "REPS X is used in multiple master programs" when it
+  has to choose. `adt_activate` now resolves the include's main program and
+  passes it as `?context=`; with exactly one candidate this just works, and with
+  several the tool asks which one, listing them by name, instead of failing.
+  A new `objects[].context` says it up front. The main-program lookup moved from
+  `adt_syntax_check` into a shared module.
+
+- **A function module could not be read without knowing its group (#104).**
+  Function modules are addressed under their function group, which callers
+  rarely have at hand — the module name is what SE37, dumps and where-used lists
+  show. `adt_get_source` and `adt_where_used` now look the group up by
+  repository search (insisting on an exact name match, so a prefix hit can never
+  substitute a different module) and report it back as `resolvedGroup`. When the
+  lookup finds nothing the error points at `adt_search_objects` instead of
+  demanding a value the caller does not have.
+
+- **Adobe forms answered "Unsupported object type" (#109).** Probing a live
+  system showed ADT publishes no source resource for these at all: its discovery
+  document lists 403 collections and none covers `sfp`/`adobe`, and the plausible
+  endpoints all 404. Repository search does know the object, and returns it under
+  the generic workbench bridge
+  (`/sap/bc/adt/vit/wb/object_type/sfpi5i/object_name/…`), which serves object
+  properties — but 404s on `/source/main`. `adt_get_source` now falls back to
+  that bridge and returns the properties with `available: false` and a note that
+  ADT serves no source for the type and the object is edited in SAP GUI. The
+  same bridge covers `SFPF` forms and transactions. The URI cannot be derived
+  from the caller's input (the path needs the TADIR subtype, `SFPI/5I` →
+  `sfpi5i`, while callers pass `SFPI`), hence the search lookup.
+
+- **Opaque backend 500s are now translated (#106, #110).** Some ADT failures name
+  a protocol mistake on the caller's side rather than a backend fault, and left
+  as-is an agent reads them as breakage and retries the identical call.
+  `errorResult` now attaches a hint for these across every tool: *Missing
+  correction number* → no transport was passed on a write; *Missing lock handle*
+  → the stateful lock is gone, re-acquire it in the same session; *…===CCAU does
+  not have any inactive version* → the class simply has no such include.
+
+### Added
+
+- **`adt_where_used` reports the call it made (#114).** The result carries
+  `request` — method, url, query, headers and the mandatory request body — so the
+  underlying ADT call can be replayed by hand in Bruno or curl. Previously the
+  URI-encoded `?uri=` and the request body were invisible to the caller. The
+  field is present on failures too.
+
+### Closed without a change
+
+- **#102** (`TRAN/T`), **#103** (`CLAS/OC`), **#107** (`MSAG/N`), **#108**
+  (`adt_run_unit_tests` crash) — all reported on 0.8.1 and since fixed, or
+  working as intended. **#105** (`adt_get_source` 500 on class test classes) was
+  not reproducible: the class is absent from three systems and reads fine on the
+  one that has it, and a missing class include answers 404 on these releases,
+  not 500.
+
 ## [0.8.57]
 
 ### Fixed

@@ -1,6 +1,7 @@
 import { objectUri, sourceUri, normalizeType } from "../object-uris.js";
 import { escapeXml } from "../xml.js";
 import { parseObjectReferences } from "../object-references.js";
+import { toContextUri, deriveMainProgram } from "../main-programs.js";
 import { errorResult, jsonResult, textResult } from "../result.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 
@@ -155,35 +156,10 @@ async function runAtcWorklist(client, sys, { uris, checkVariant, maxResults }) {
   };
 }
 
-// Normalize a caller-supplied include context into an ADT object URI. Accepts a
-// full ADT path as-is; treats anything else as a program name.
-//
-// A real ADT object URI begins with the ADT path prefix. A *namespaced* ABAP
-// name (e.g. "/FGLR/R_PO_ASSET_CREATE") also begins with "/", so keying on a
-// leading slash alone misclassified it as a ready-made URI and produced an
-// unmappable ?context= → 500 uriMappingError (#67). Only the ADT-path prefix
-// marks a ready URI; every other value — bare or namespaced — is a program name
-// whose slashes must be percent-encoded into the programs URI.
-export function toContextUri(input) {
-  const s = String(input).trim();
-  if (s.startsWith("/sap/bc/adt/")) return s;
-  return `/sap/bc/adt/programs/programs/${encodeURIComponent(s.toLowerCase())}`;
-}
-
-// Best-effort: resolve an include's first main program via its /mainprograms
-// sub-resource. Any failure (older release, no main program, 4xx) returns
-// undefined so the check still runs (and the response carries a hint).
-async function deriveMainProgram(client, includeObjUri) {
-  try {
-    const res = await client.request({ path: `${includeObjUri}/mainprograms` });
-    if (!res.ok) return undefined;
-    const text = await res.text();
-    const m = text.match(/adtcore:uri="([^"]+)"/i);
-    return m ? m[1].replace(/&amp;/g, "&") : undefined;
-  } catch {
-    return undefined;
-  }
-}
+// Include-context helpers live in ../main-programs.js — adt_activate needs the
+// same resolution (#113). Re-exported so the historical import path keeps
+// working for callers and tests.
+export { toContextUri };
 
 export const tools = [
   {
