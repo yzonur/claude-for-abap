@@ -3,7 +3,41 @@ import path from "node:path";
 import { sourceUri, objectUri, normalizeType, baseType, METADATA_XML_ACCEPT } from "../object-uris.js";
 import { acquireLock, releaseLock } from "../lock.js";
 import { errorResult, jsonResult, textResult } from "../result.js";
+import { resolveGroup } from "../function-modules.js";
+import {
+  findObjectByName,
+  isWorkbenchUri,
+  fetchWorkbenchProperties,
+  parseObjectProperties,
+} from "../workbench-objects.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
+
+// Last resort for a type with no source endpoint: ask the repository search
+// what the object actually is, and if it answers with a workbench-bridge URI,
+// return the object properties served there together with a plain statement
+// that ADT has no source document for it (#109). Returns undefined when this
+// is not that situation, so the caller falls through to its own error.
+async function workbenchFallback(client, sys, name) {
+  const found = await findObjectByName(client, name);
+  if (!found || !isWorkbenchUri(found.uri)) return undefined;
+  const res = await fetchWorkbenchProperties(client, found.uri);
+  if (!res.ok) return undefined;
+  return jsonResult({
+    system: sys,
+    object: found.name ?? name,
+    type: found.type,
+    path: found.uri,
+    format: "properties",
+    available: false,
+    properties: parseObjectProperties(res.text),
+    note:
+      `ADT serves no source document for ${found.type} — the type is not in the ADT ` +
+      "discovery document and is reachable only through the generic workbench bridge, " +
+      "which returns object properties (its /source/main is 404). Edit the object in SAP GUI. " +
+      "The properties shown here are everything ADT exposes.",
+    raw: parseObjectProperties(res.text) ? undefined : res.text.slice(0, 4000),
+  });
+}
 
 // Read a local file for a write. The MCP process reads it directly, so a large
 // object's source never has to travel back through the agent's per-call I/O cap
@@ -334,6 +368,13 @@ export function register({ getClient }) {
         );
       }
       const { client, name: sys } = getClient(args.system);
+      // A function module is addressed under its group, which callers usually
+      // don't have at hand — look it up rather than refusing the read (#104).
+      const { group, resolvedGroup } = await resolveGroup(client, {
+        type: args.type,
+        name: args.object,
+        group: args.group,
+      });
       let t;
       let path;
       try {
@@ -343,15 +384,25 @@ export function register({ getClient }) {
         path = sourceUri({
           type: args.type,
           name: args.object,
-          group: args.group,
+          group,
           include: args.include,
         });
       } catch (err) {
         // Unknown/unsupported object types (e.g. WAPA) reach the dispatch
-        // tables and throw. Return that as a clean tool error with an escape
-        // hatch hint instead of letting it surface as a crash.
+        // tables and throw. Before giving up, check whether this is one of the
+        // types ADT serves only through the generic workbench bridge — Adobe
+        // forms, transactions and friends have metadata but no source document
+        // (#109). Returning that beats an "Unsupported object type" dead end.
+        if (!/pass 'group'/.test(err.message)) {
+          const meta = await workbenchFallback(client, sys, args.object);
+          if (meta) return meta;
+        }
+        const notFound = /pass 'group'/.test(err.message)
+          ? ` Object search found no function module named '${args.object}' — check the name, ` +
+            "or locate it with adt_search_objects."
+          : "";
         return textResult(
-          `adt_get_source: ${err.message}. If this type has no high-level mapping yet, ` +
+          `adt_get_source: ${err.message}.${notFound} If this type has no high-level mapping yet, ` +
             `fetch it with adt_request against its ADT source URI.`,
           true
         );
@@ -435,6 +486,9 @@ export function register({ getClient }) {
         system: sys,
         object: args.object,
         type: normalizeType(args.type),
+        // Say so when the function group was looked up rather than supplied —
+        // the caller may want to pass it back on the next call (#104).
+        ...(resolvedGroup ? { group, resolvedGroup: true } : {}),
         path,
         bytes: slice.length,
         lines: sliceLast - sliceFirst + 1,

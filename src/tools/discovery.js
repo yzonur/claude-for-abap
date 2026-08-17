@@ -2,6 +2,7 @@ import { objectUri, sourceUri } from "../object-uris.js";
 import { fetchPackageNodes } from "../node-structure.js";
 import { parseObjectReferences, parseUsageReferences } from "../object-references.js";
 import { errorResult, jsonResult, textResult } from "../result.js";
+import { resolveGroup } from "../function-modules.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 
 // Default cap on the where-used list. RIS happily returns five figures of
@@ -114,7 +115,7 @@ export const tools = [
   {
     name: "adt_where_used",
     description:
-      "Where-used list for an object. Returns the references that point to it. Widely-used objects can have thousands of references, so the list is capped at `maxResults` (default 200) — `numberOfResults` always reports the backend's full count and `truncated` says whether the list was cut.",
+      "Where-used list for an object. Returns the references that point to it. Widely-used objects can have thousands of references, so the list is capped at `maxResults` (default 200) — `numberOfResults` always reports the backend's full count and `truncated` says whether the list was cut. The result also carries `request` (method, url, headers, body) so the underlying ADT call can be replayed by hand.",
     inputSchema: {
       type: "object",
       properties: {
@@ -289,13 +290,25 @@ export function register({ getClient }) {
 
     adt_where_used: async (args) => {
       const { client, name: sys } = getClient(args.system);
+      // Function modules are addressed under their group; look it up when the
+      // caller only knows the module name (#104).
+      const { group } = await resolveGroup(client, {
+        type: args.type,
+        name: args.object,
+        group: args.group,
+      });
       let uri;
       try {
-        uri = objectUri({ type: args.type, name: args.object, group: args.group });
+        uri = objectUri({ type: args.type, name: args.object, group });
       } catch (err) {
-        // e.g. a function module (FUGR/FF) passed without its group — objectUri
-        // throws. Return a clean tool error instead of crashing (#74).
-        return textResult(`adt_where_used: ${err.message}`, true);
+        // e.g. a function module (FUGR/FF) whose group was neither supplied nor
+        // resolvable — objectUri throws. Return a clean tool error instead of
+        // crashing (#74).
+        const notFound = /pass 'group'/.test(err.message)
+          ? ` Object search found no function module named '${args.object}' — check the name, ` +
+            "or locate it with adt_search_objects."
+          : "";
+        return textResult(`adt_where_used: ${err.message}.${notFound}`, true);
       }
       // The endpoint requires a real request body with a <usageReferenceRequest>
       // root; the previous empty POST 400'd with "System expected the element
@@ -306,16 +319,29 @@ export function register({ getClient }) {
         `<usagereferences:usageReferenceRequest xmlns:usagereferences="http://www.sap.com/adt/ris/usageReferences">` +
         `<usagereferences:affectedObjects/>` +
         `</usagereferences:usageReferenceRequest>`;
-      const res = await client.request({
+      // Echoed back on the result so the exact call can be replayed by hand in
+      // Bruno / curl / the browser — the URI-encoded ?uri= and the mandatory
+      // request body are otherwise invisible to the caller (#114).
+      const request = {
         method: "POST",
         path: "/sap/bc/adt/repository/informationsystem/usageReferences",
         query: { uri },
+        headers: { "Content-Type": "application/*", Accept: "application/*" },
+        body,
+      };
+      request.url = `${request.path}?uri=${encodeURIComponent(uri)}`;
+      const res = await client.request({
+        method: "POST",
+        path: request.path,
+        query: request.query,
         headers: { "Content-Type": "application/*" },
         accept: "application/*",
         body,
       });
       const text = await res.text();
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"));
+      if (!res.ok) {
+        return errorResult(sys, res.status, text, res.headers.get("content-type"), { request });
+      }
       const refs = parseUsageReferences(text);
       // The backend's own count, from <usageReferenceResult numberOfResults="…">.
       // It differs from refs.length: the parser walks every <adtObject> node,
@@ -337,6 +363,7 @@ export function register({ getClient }) {
           ? { truncated: true, totalParsed: refs.length, maxResults: max }
           : {}),
         references: shown,
+        request,
         raw: refs.length === 0 ? text : undefined,
       });
     },

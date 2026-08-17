@@ -100,6 +100,60 @@ function extractProperties(body) {
   return Object.keys(result).length > 0 ? result : null;
 }
 
+// Some ADT failures arrive as a bare 500 whose message names a *protocol*
+// mistake on our side rather than a backend problem — "Missing correction
+// number" is really "you did not pass a transport", "Missing lock handle" is
+// really "the stateful lock is gone". Left untranslated the agent reads them as
+// backend breakage and retries the same call (#106, #110). Match on the
+// message, not the exception type: the same type covers unrelated failures.
+const ERROR_HINTS = [
+  {
+    match: /missing correction number/i,
+    hint:
+      "The object is under change control and the write carried no transport. Pass `transport` " +
+      "(a modifiable request owned by you — adt_list_transports shows them), or create one with " +
+      "adt_create_transport.",
+  },
+  {
+    match: /missing lock handle/i,
+    hint:
+      "No valid lock handle reached the backend. ADT locks are bound to one stateful session: " +
+      "acquire the lock with adt_lock and use the returned `lockHandle` in the same session. " +
+      "A handle from an earlier session (or one already released) is no longer accepted — " +
+      "call adt_lock again to get a fresh one.",
+  },
+  {
+    // Asking for a class include that does not exist answers with the name of
+    // the generated include (…===CCAU for test classes, ===CCIMP for local
+    // definitions) and a line about inactive versions — which describes the
+    // lookup ADT tried, not the caller's problem. Say what it means.
+    match: /===\w+ does not have any inactive version/i,
+    hint:
+      "That class include does not exist. ADT generates one include per section " +
+      "(===CCAU test classes, ===CCIMP local implementations, ===CCDEF local definitions) " +
+      "and only for the sections the class actually has. Read the class object URI first — " +
+      "its <class:include> entries list which ones are present.",
+  },
+  {
+    match: /is used in multiple master programs/i,
+    hint:
+      "The include belongs to more than one main program, so activation cannot pick a context on " +
+      "its own. Activate the master program instead (pass its name to adt_activate), or pass the " +
+      "include together with the owning program in the same `objects` list.",
+  },
+];
+
+// Best-effort, side-effect-free: returns a caller-facing hint for a parsed ADT
+// error, or undefined when nothing matches.
+export function hintForAdtError(parsed) {
+  if (!parsed) return undefined;
+  const haystack = [parsed.message, parsed.localizedMessage, parsed.properties?.longText]
+    .filter((s) => typeof s === "string" && s.length > 0)
+    .join("\n");
+  if (!haystack) return undefined;
+  return ERROR_HINTS.find((h) => h.match.test(haystack))?.hint;
+}
+
 function stripCData(s) {
   if (!s) return s;
   const trimmed = s.trim();

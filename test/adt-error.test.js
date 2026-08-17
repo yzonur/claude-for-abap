@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseAdtError } from "../src/adt-error.js";
+import { parseAdtError, hintForAdtError } from "../src/adt-error.js";
+import { errorResult } from "../src/result.js";
+
+const envelope = (type, message) => `<?xml version="1.0" encoding="UTF-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communication">
+  <namespace id="com.sap.adt.functions"/>
+  <type id="${type}"/>
+  <message lang="EN">${message}</message>
+</exc:exception>`;
 
 const SAMPLE_ENVELOPE = `<?xml version="1.0" encoding="UTF-8"?>
 <exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communication">
@@ -9,6 +17,56 @@ const SAMPLE_ENVELOPE = `<?xml version="1.0" encoding="UTF-8"?>
   <message lang="EN">Object ZFOO does not exist</message>
   <localizedMessage lang="EN">Object ZFOO does not exist (localized)</localizedMessage>
 </exc:exception>`;
+
+// ─── #106 / #110 / #113: opaque 500s translated into an actionable hint ────────
+
+test("hintForAdtError: 'Missing correction number' points at the transport — #106", () => {
+  const parsed = parseAdtError(
+    envelope("ExceptionDuringFunctionGroupSerialization", "Missing correction number"),
+    "application/xml"
+  );
+  assert.match(hintForAdtError(parsed), /transport/i);
+  assert.match(hintForAdtError(parsed), /adt_create_transport/);
+});
+
+test("hintForAdtError: 'Missing lock handle' points at re-locking — #110", () => {
+  const parsed = parseAdtError(
+    envelope("ExceptionDuringFunctionGroupSerialization", "Missing lock handle"),
+    "application/xml"
+  );
+  assert.match(hintForAdtError(parsed), /adt_lock/);
+  assert.match(hintForAdtError(parsed), /stateful session/i);
+});
+
+test("hintForAdtError: multiple master programs points at the include context — #113", () => {
+  const parsed = parseAdtError(
+    envelope("ExceptionActivationServiceFailure", "REPS ZHURECINBOUND_TOP is used in multiple master programs"),
+    "application/xml"
+  );
+  assert.match(hintForAdtError(parsed), /adt_activate/);
+});
+
+test("hintForAdtError: an unremarkable failure gets no hint", () => {
+  const parsed = parseAdtError(SAMPLE_ENVELOPE, "application/xml");
+  assert.equal(hintForAdtError(parsed), undefined);
+  assert.equal(hintForAdtError(null), undefined);
+});
+
+test("errorResult carries the hint alongside the parsed error", () => {
+  const r = errorResult(
+    "FAKE",
+    500,
+    envelope("ExceptionDuringFunctionGroupSerialization", "Missing correction number"),
+    "application/xml"
+  );
+  const out = JSON.parse(r.content[0].text);
+  assert.equal(r.isError, true);
+  assert.match(out.hint, /transport/i);
+  assert.equal(out.error.message, "Missing correction number");
+
+  const plain = JSON.parse(errorResult("FAKE", 500, SAMPLE_ENVELOPE, "application/xml").content[0].text);
+  assert.equal(plain.hint, undefined, "no hint invented for ordinary failures");
+});
 
 test("parses the standard ADT exception envelope", () => {
   const r = parseAdtError(SAMPLE_ENVELOPE, "application/xml");

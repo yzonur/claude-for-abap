@@ -3,13 +3,14 @@ import { escapeXml } from "../xml.js";
 import { acquireLock, releaseLock } from "../lock.js";
 import { buildCreateRequest, postCreate } from "../object-create.js";
 import { errorResult, jsonResult, textResult } from "../result.js";
+import { toContextUri, listMainPrograms } from "../main-programs.js";
 import { OBJECT_TYPE_HINT, SYSTEM_HINT } from "./_shared.js";
 
 export const tools = [
   {
     name: "adt_activate",
     description:
-      "Activate one or more ABAP objects. In multi-developer scenarios where the object's components are locked in a separate task under the same transport, set processRedoneOOSourceVersionOnly=true to ask SAP to re-activate only the redone OO source versions (bypasses the 'Object components locked in request and separate task' 403).",
+      "Activate one or more ABAP objects. Includes are activated in the context of their main program: the context is auto-resolved, and when the include belongs to several master programs the tool asks which one instead of failing with a 500. In multi-developer scenarios where the object's components are locked in a separate task under the same transport, set processRedoneOOSourceVersionOnly=true to ask SAP to re-activate only the redone OO source versions (bypasses the 'Object components locked in request and separate task' 403).",
     inputSchema: {
       type: "object",
       properties: {
@@ -23,6 +24,11 @@ export const tools = [
               name: { type: "string" },
               type: { type: "string", description: OBJECT_TYPE_HINT },
               group: { type: "string" },
+              context: {
+                type: "string",
+                description:
+                  "For type=include only: the master program to activate it in — a program name or a full ADT object URI. Auto-resolved when the include has exactly one master program.",
+              },
             },
             required: ["name", "type"],
           },
@@ -150,15 +156,43 @@ export function register({ getClient }) {
         }
       }
       const { client, name: sys } = getClient(args.system);
-      const refs = args.objects
-        .map((o) => {
-          const uri = objectUri({ type: o.type, name: o.name, group: o.group });
-          return `<adtcore:objectReference adtcore:uri="${escapeXml(uri)}" adtcore:name="${escapeXml(o.name.toUpperCase())}"/>`;
-        })
-        .join("");
+      const refs = [];
+      for (const o of args.objects) {
+        const uri = objectUri({ type: o.type, name: o.name, group: o.group });
+        // An include compiles only inside a main program. Without a ?context=
+        // the activation service picks one itself and gives up when there is
+        // more than one candidate: 500 "REPS X is used in multiple master
+        // programs" (#113). Resolve it here so the common case just works and
+        // the ambiguous case gets an answerable question instead of a 500.
+        if (normalizeType(o.type) === "INCL") {
+          let context = o.context ? toContextUri(o.context) : undefined;
+          if (!context) {
+            const mains = await listMainPrograms(client, uri);
+            if (mains.length > 1) {
+              return textResult(
+                `adt_activate: include '${o.name}' belongs to ${mains.length} master programs, so ` +
+                  "activation cannot pick a context on its own. Re-run with `context` set to the one " +
+                  `you mean: ${mains.map((m) => m.name ?? m.uri).join(", ")}. ` +
+                  "Activating the master program itself also works.",
+                true
+              );
+            }
+            context = mains[0]?.uri;
+          }
+          refs.push(
+            `<adtcore:objectReference adtcore:uri="${escapeXml(
+              context ? `${uri}?context=${encodeURIComponent(context)}` : uri
+            )}" adtcore:name="${escapeXml(o.name.toUpperCase())}"/>`
+          );
+          continue;
+        }
+        refs.push(
+          `<adtcore:objectReference adtcore:uri="${escapeXml(uri)}" adtcore:name="${escapeXml(o.name.toUpperCase())}"/>`
+        );
+      }
       const body =
         `<?xml version="1.0" encoding="UTF-8"?>` +
-        `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">${refs}</adtcore:objectReferences>`;
+        `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">${refs.join("")}</adtcore:objectReferences>`;
       const preaudit =
         typeof args.preauditRequested === "boolean"
           ? args.preauditRequested

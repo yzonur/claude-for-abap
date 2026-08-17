@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { register, parseVersionList } from "../src/tools/versions.js";
+import { register, parseVersionList, VERSIONS_ACCEPT } from "../src/tools/versions.js";
 
 function makeCtx({ responses } = {}) {
   const calls = [];
@@ -86,6 +86,43 @@ test("adt_compare_versions: identical sources → identical:true", async () => {
   const r = await h.adt_compare_versions({ object: "ZCL_A", type: "class", from: "active", to: "active" });
   const out = JSON.parse(r.content[0].text);
   assert.equal(out.identical, true);
+});
+
+test("parseVersionList: falls back to atom entries — #111", () => {
+  const xml =
+    '<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">' +
+    '<atom:entry><atom:title>000002</atom:title>' +
+    '<atom:link href="/sap/bc/adt/vit/versions/2" rel="self"/>' +
+    "<adtcore:author>DEV</adtcore:author></atom:entry>" +
+    '<atom:entry><atom:title>000001</atom:title>' +
+    "<adtcore:author>DEV2</adtcore:author></atom:entry>" +
+    "</atom:feed>";
+  const v = parseVersionList(xml);
+  assert.equal(v.length, 2);
+  assert.equal(v[0].title, "000002");
+  assert.equal(v[0].author, "DEV");
+  assert.equal(v[0].href, "/sap/bc/adt/vit/versions/2");
+  assert.equal(v[1].author, "DEV2");
+  // xmlns declarations are noise and must not leak into the version rows.
+  assert.equal(v[0].xmlns, undefined);
+});
+
+test("adt_list_versions: asks for the atom feed the endpoint serves — #111", async () => {
+  const { ctx, calls } = makeCtx({ responses: [resp("<atom:feed/>")] });
+  const h = register(ctx);
+  await h.adt_list_versions({ object: "ZI_A", type: "cds" });
+  assert.equal(calls[0].accept, VERSIONS_ACCEPT);
+  assert.match(calls[0].accept, /atom\+xml/);
+});
+
+test("adt_compare_versions: numeric version is rejected before the round trip — #112", async () => {
+  const { ctx, calls } = makeCtx({ responses: [resp("x"), resp("y")] });
+  const h = register(ctx);
+  const r = await h.adt_compare_versions({ object: "ZI_A", type: "cds", from: "1", to: "active" });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /only accepts/);
+  assert.match(r.content[0].text, /`from`/);
+  assert.equal(calls.length, 0);
 });
 
 test("adt_compare_versions: from-side fetch error is surfaced with side label", async () => {

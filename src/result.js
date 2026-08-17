@@ -1,4 +1,4 @@
-import { parseAdtError } from "./adt-error.js";
+import { parseAdtError, hintForAdtError } from "./adt-error.js";
 
 export function textResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
@@ -10,6 +10,9 @@ export function jsonResult(value, isError = false) {
 
 export function errorResult(system, status, body, contentType, extra = {}) {
   const parsed = parseAdtError(body, contentType);
+  // A caller-side hint when the backend message describes something we asked
+  // for wrongly (missing transport / stale lock handle) rather than a fault.
+  const hint = hintForAdtError(parsed);
   const result = jsonResult(
     {
       system,
@@ -17,6 +20,7 @@ export function errorResult(system, status, body, contentType, extra = {}) {
       ok: false,
       ...extra,
       error: parsed ?? { raw: typeof body === "string" ? body.slice(0, 4000) : body },
+      ...(hint ? { hint } : {}),
     },
     true
   );
