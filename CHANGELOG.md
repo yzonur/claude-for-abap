@@ -6,6 +6,29 @@ adheres to semantic versioning once it reaches 1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`adt_system_info`** — identifies the connected SAP system's SAP_BASIS
+  release/extension release and whether it's S/4HANA (S4CORE/S4COREOP
+  installed) vs classic ECC/NetWeaver. Read-only; reuses the same Data Preview
+  freestyle-SELECT mechanism as `adt_read_table` against table `CVERS`, so no
+  new ADT endpoint and the same NetWeaver 7.55+ / S/4HANA baseline. Addresses
+  the `adt_system_info` item from TODO.md's "Tool additions — nice-to-have":
+  Clean Core prompts currently guess at ECC vs S/4 heuristically; this gives a
+  deterministic signal instead.
+
+### Fixed
+
+- **`adt_search_objects` — unhelpful 406 on an unrecognized `objectType` (#117).**
+  A typo'd or otherwise unrecognized `objectType` filter (e.g. `"BADII"`) comes
+  back from the search backend as 406 `ExceptionResourceNotAcceptable`
+  (`SADT_RESOURCE`/037). Despite the exception class this is SAP's own
+  filter-value validation, not a content-negotiation failure — confirmed live
+  by reproducing it even with `Accept: */*`. `adt_search_objects` now adds a
+  hint pointing at the actual problem (use a TADIR-style code, e.g. `CLAS/OC`,
+  `PROG/P`, `DDLS/DF`, or omit `objectType`) instead of leaving the caller to
+  chase an Accept header that was never the cause.
+
 ## [0.8.58]
 
 Clearing the open ADT error reports. Two of them were settled by probing a live

@@ -51,7 +51,7 @@ for the per-tool live-verified vs best-effort breakdown._
 - [ ] `adt_auth_check` — SU24 auth objects required by a transaction / object.
 - [ ] Code-intelligence pack — method-level call hierarchy, interface implementations, redefined methods, type hierarchy. `adt_where_used` is the broad sweep; agent needs the surgical version.
 - [ ] `adt_translations` — long texts for messages / classes (SE63 lite).
-- [ ] `adt_system_info` — release, SP level, S/4 vs ECC, ABAP Cloud availability. Clean Core prompts currently guess at this via heuristics; with a real signal the ECC backoff becomes deterministic.
+- [x] `adt_system_info` — SAP_BASIS release/ext. release + S/4 vs ECC (via `CVERS`), shipped in [Unreleased]. SP level and ABAP Cloud availability are not covered — `CVERS` doesn't carry SP level and ABAP Cloud/Steampunk needs a separate check.
 - [ ] `adt_transport_queue` — STMS import buffer status. "Where is TR X right now — DEV, in QAS buffer, imported into PRD?"
 - [ ] `adt_compare_ddic` — DDIC metadata diff (fields, indexes, foreign keys, technical settings). Today only source can be compared cross-system; for tables that's not enough.
 

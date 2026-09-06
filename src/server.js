@@ -27,6 +27,7 @@ import * as crossSystemTools from "./tools/cross-system.js";
 import * as transportTools from "./tools/transports.js";
 import * as runtimeTools from "./tools/runtime.js";
 import * as dataTools from "./tools/data.js";
+import * as systemInfoTools from "./tools/system-info.js";
 import * as requestTools from "./tools/request.js";
 import * as versionTools from "./tools/versions.js";
 import * as noteTools from "./tools/notes.js";
@@ -118,6 +119,7 @@ const TOOL_MODULES = [
   transportTools,
   runtimeTools,
   dataTools,
+  systemInfoTools,
   requestTools,
   versionTools,
   noteTools,
