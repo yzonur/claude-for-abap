@@ -276,7 +276,28 @@ export function register({ getClient }) {
         res = await tryRequest({});
         text = await res.text();
       }
-      if (!res.ok) return errorResult(sys, res.status, text, res.headers.get("content-type"));
+      if (!res.ok) {
+        const result = errorResult(sys, res.status, text, res.headers.get("content-type"));
+        // A non-existent/typo'd `objectType` (e.g. "BADII" instead of a real
+        // TADIR code) comes back as 406 ExceptionResourceNotAcceptable /
+        // SADT_RESOURCE-037 — despite the exception class, this is SAP's own
+        // filter-value validation, not a content-negotiation failure: it
+        // reproduces even with `Accept: */*` (#117). Point the caller at the
+        // actual problem instead of leaving them chasing an Accept header.
+        if (res.status === 406 && args.objectType) {
+          const payload = JSON.parse(result.content[0].text);
+          if (!payload.hint) {
+            payload.hint =
+              `objectType '${args.objectType}' was rejected by the search backend (406 ` +
+              "ExceptionResourceNotAcceptable) — this is SAP's filter-value validation, not a " +
+              "real content-negotiation problem (it reproduces even with Accept: */*). It usually " +
+              "means the value isn't a code the backend recognizes. Use a TADIR-style code, e.g. " +
+              "'CLAS/OC', 'PROG/P', 'DDLS/DF' — or omit objectType to search across all types.";
+            result.content[0].text = JSON.stringify(payload, null, 2);
+          }
+        }
+        return result;
+      }
       const refs = parseObjectReferences(text);
       return jsonResult({
         system: sys,

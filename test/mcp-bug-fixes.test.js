@@ -184,6 +184,57 @@ test("adt_search_objects: happy path doesn't retry", async () => {
   assert.equal(calls[0].query.operation, "quickSearch");
 });
 
+// ─── Bug #117: adt_search_objects 406 on an unrecognized objectType ───────────
+
+const T117_406_BODY = `<?xml version="1.0" encoding="UTF-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communication">
+  <namespace id="com.sap.adt"/>
+  <type id="ExceptionResourceNotAcceptable"/>
+  <message lang="EN">The message content is not acceptable</message>
+  <properties>
+    <entry key="T100KEY-ID">SADT_RESOURCE</entry>
+    <entry key="T100KEY-NO">037</entry>
+  </properties>
+</exc:exception>`;
+
+test("adt_search_objects: 406 with an objectType filter gets an explanatory hint", async () => {
+  const { ctx } = makeCtx({
+    responses: [
+      {
+        ok: false,
+        status: 406,
+        headers: { get: () => "application/xml" },
+        text: async () => T117_406_BODY,
+      },
+    ],
+  });
+  const h = registerDiscovery(ctx);
+  const r = await h.adt_search_objects({ query: "*", objectType: "BADII", maxResults: 1 });
+  assert.equal(r.isError, true);
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(payload.status, 406);
+  assert.match(payload.hint, /objectType 'BADII' was rejected/);
+  assert.match(payload.hint, /not a real content-negotiation problem/);
+});
+
+test("adt_search_objects: 406 without an objectType filter gets no objectType hint", async () => {
+  const { ctx } = makeCtx({
+    responses: [
+      {
+        ok: false,
+        status: 406,
+        headers: { get: () => "application/xml" },
+        text: async () => T117_406_BODY,
+      },
+    ],
+  });
+  const h = registerDiscovery(ctx);
+  const r = await h.adt_search_objects({ query: "*" });
+  assert.equal(r.isError, true);
+  const payload = JSON.parse(r.content[0].text);
+  assert.equal(payload.hint, undefined);
+});
+
 // ─── Bug A: adt_search_objects uses GET (POST → ris_request_type 400) ──────────
 
 test("adt_search_objects: quickSearch goes over GET, not POST", async () => {
