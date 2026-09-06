@@ -6,6 +6,17 @@ adheres to semantic versioning once it reaches 1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`adt_system_info`** — identifies the connected SAP system's SAP_BASIS
+  release/extension release and whether it's S/4HANA (S4CORE/S4COREOP
+  installed) vs classic ECC/NetWeaver. Read-only; reuses the same Data Preview
+  freestyle-SELECT mechanism as `adt_read_table` against table `CVERS`, so no
+  new ADT endpoint and the same NetWeaver 7.55+ / S/4HANA baseline. Addresses
+  the `adt_system_info` item from TODO.md's "Tool additions — nice-to-have":
+  Clean Core prompts currently guess at ECC vs S/4 heuristically; this gives a
+  deterministic signal instead.
+
 ## [0.8.58]
 
 Clearing the open ADT error reports. Two of them were settled by probing a live

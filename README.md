@@ -44,7 +44,7 @@ prompts** that turn the tool surface into outcome-shaped slash commands
 | Transports | `adt_list_transports`, `adt_get_transport`, `adt_create_transport`, `adt_release_transport` |
 | Runtime errors | `adt_list_dumps`, `adt_get_dump` |
 | Debugger | `adt_debug_set_breakpoint`, `adt_debug_delete_breakpoint`, `adt_debug_listen`, `adt_debug_stack`, `adt_debug_variables`, `adt_debug_step`, `adt_debug_goto_stack`, `adt_debug_set_variable`, `adt_debug_set_watchpoint`, `adt_debug_delete_watchpoint`, `adt_debug_stop` |
-| Data | `adt_read_table` |
+| Data | `adt_read_table`, `adt_system_info` |
 | Generation | `adt_rap_scaffold` |
 | Experimental¹ | `adt_get_note`, `adt_check_note_status`, `adt_implement_note`, `adt_list_locks`, `adt_schedule_job`, `adt_read_spool` |
 | Escape hatch | `adt_request` |
@@ -422,6 +422,7 @@ by default; enable it per system with `"debug": { "allowRequestUser": true }`
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `adt_read_table` | Run an OpenSQL SELECT via the ADT Data Preview API. | SE16-style table reads. SELECT-only — INSERT/UPDATE/DELETE rejected client-side; the SAP endpoint enforces server-side too. `maxRows` capped at 5000 (default 100). Requires NetWeaver 7.55+ / S/4HANA. |
+| `adt_system_info` | SAP_BASIS release/ext. release, and whether S/4HANA (S4CORE/S4COREOP) is installed. | Read-only; two canned `adt_read_table`-style SELECTs against `CVERS`, same NetWeaver 7.55+ / S/4HANA baseline as `adt_read_table`. Useful before picking a release-sensitive tool, or before applying Clean Core guidance. |
 
 ### Transports
 
